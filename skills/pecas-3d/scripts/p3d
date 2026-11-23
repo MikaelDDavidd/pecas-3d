@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+# p3d - gera, valida e abre peças do FreeCAD por script. macOS e Linux.
+#
+#   p3d setup                     acha o FreeCAD 1.x ou instala o 1.1.4 (só Linux baixa sozinho)
+#   p3d diagnostico               mostra o que foi achado, sem instalar nada
+#   p3d gerar peca.py [k=v ...]   roda o script da peça sem tela (.FCStd, .step, .stl)
+#   p3d validar arq.FCStd [--exportar]   confere de novo um projeto editado na tela
+#   p3d render arq.stl [png] [cor] [iso|tras|topo]   preview PNG sem tela
+#   p3d abrir arq.FCStd           abre no FreeCAD com janela
+#   p3d testar                    testes da lib + uma peça de exemplo
+#   p3d nova <nome> <pasta>       cria <pasta>/<nome>/peca.py a partir do modelo
+#   p3d --version | --help
+#
+# Variáveis: FREECADCMD e FREECAD_GUI (forçam o executável), P3D_TIMEOUT (segundos por
+# script, padrão 1800), XDG_CONFIG_HOME e XDG_DATA_HOME.
+set -euo pipefail
+
+VERSAO=0.1.0
+FC_VERSAO=1.1.4
+FC_SHA_x86_64=f6dc6ba676e5ac96a565ebc8d657232f94c6158e85b4352141bd1a46f6b43434
+FC_SHA_aarch64=675d1a4295b2183e0e1d816a4b5557dcb63aeced4e60aaa28d6c3686f4c71dc9
+ESPACO_MB=4500
+
+# Pasta da skill, seguindo link simbólico (readlink -f não existe no macOS antigo).
+alvo="${BASH_SOURCE[0]}"
+while [ -L "$alvo" ]; do
+  dir="$(cd -P "$(dirname "$alvo")" && pwd)"
+  alvo="$(readlink "$alvo")"
+  case "$alvo" in /*) ;; *) alvo="$dir/$alvo" ;; esac
+done
+SKILL="$(cd -P "$(dirname "$alvo")/.." && pwd)"
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pecas-3d"
+CONF="$CONF_DIR/config"
+DADOS="${XDG_DATA_HOME:-$HOME/.local/share}/pecas-3d"
+SO="$(uname -s)"
+ARCH="$(uname -m)"
+
+erro() { echo "p3d: $*" >&2; exit 1; }
+info() { echo "p3d: $*" >&2; }
+
+case "$SO" in
+  Darwin|Linux) ;;
+  *) erro "sistema $SO não suportado. No Windows, use o WSL2 (Ubuntu)." ;;
+esac
+
+if [ "$SO" = Darwin ]; then LOCALE_UTF8=en_US.UTF-8; else LOCALE_UTF8=C.UTF-8; fi
+
+# Variável de ambiente ganha da config; config é lida como texto, nunca executada.
+ENV_CMD="${FREECADCMD:-}"
+ENV_GUI="${FREECAD_GUI:-}"
+FREECADCMD=""; FREECAD_GUI=""; FREECAD_VERSAO=""
+
+ler_config() {
+  [ -f "$CONF" ] || return 0
+  local chave valor
+  while IFS='=' read -r chave valor; do
+    case "$chave" in
+      FREECADCMD) FREECADCMD="$valor" ;;
+      FREECAD_GUI) FREECAD_GUI="$valor" ;;
+      FREECAD_VERSAO) FREECAD_VERSAO="$valor" ;;
+    esac
+  done < "$CONF"
+  [ -n "$ENV_CMD" ] && FREECADCMD="$ENV_CMD"
+  [ -n "$ENV_GUI" ] && FREECAD_GUI="$ENV_GUI"
+  return 0
+}
+
+gravar_config() {
+  mkdir -p "$CONF_DIR"
+  printf 'FREECADCMD=%s\nFREECAD_GUI=%s\nFREECAD_VERSAO=%s\n' "$FREECADCMD" "$FREECAD_GUI" "$FREECAD_VERSAO" > "$CONF"
+}
+
+# Roda um comando com limite de tempo (o macOS não tem `timeout`). Devolve 124 se estourar.
+com_limite() {
+  local segundos="$1"; shift
+  "$@" &
+  local pid=$!
+  # O vigia não pode herdar o stdout: um pipe esperaria o sleep dele terminar.
+  (
+    trap 'kill "$s" 2>/dev/null; exit 0' TERM
+    sleep "$segundos" & s=$!
+    wait "$s"
+    kill -TERM "$pid" 2>/dev/null; sleep 5; kill -KILL "$pid" 2>/dev/null
+  ) >/dev/null 2>&1 &
+  local vigia=$!
+  local rc=0
+  { wait "$pid"; } 2>/dev/null || rc=$?
+  kill "$vigia" 2>/dev/null || true
+  wait "$vigia" 2>/dev/null || true
+  [ $rc -eq 143 ] || [ $rc -eq 137 ] && return 124
+  return "$rc"
+}
+
+versao_de() {  # versão de um freecadcmd ("1.1.4") ou vazio
+  local saida
+  saida="$(LC_ALL=$LOCALE_UTF8 com_limite 90 "$1" -c "import FreeCAD; print('VER=' + '.'.join(FreeCAD.Version()[:3]))" </dev/null 2>/dev/null || true)"
+  printf '%s\n' "$saida" | sed -n 's/.*VER=\([0-9][0-9.]*\).*/\1/p' | tail -1
+}
+
+versao_ok() { local m="${1%%.*}"; [ -n "$1" ] && [ "$m" -ge 1 ] 2>/dev/null; }
+
+candidatos() {  # linhas "freecadcmd|gui"
+  [ -n "$ENV_CMD" ] && echo "$ENV_CMD|$ENV_GUI"
+  [ -n "$FREECADCMD" ] && echo "$FREECADCMD|$FREECAD_GUI"
+  if [ "$SO" = Darwin ]; then
+    for app in /Applications/FreeCAD.app "$HOME/Applications/FreeCAD.app"; do
+      if [ -x "$app/Contents/Resources/bin/freecadcmd" ]; then
+        echo "$app/Contents/Resources/bin/freecadcmd|$app/Contents/MacOS/FreeCAD"
+      fi
+    done
+  else
+    if [ -f "$DADOS/freecad-$FC_VERSAO/.ok" ]; then
+      echo "$DADOS/freecad-$FC_VERSAO/app/usr/bin/freecadcmd|$DADOS/freecad-$FC_VERSAO/app/AppRun"
+    fi
+    local nome c
+    for nome in freecadcmd FreeCADCmd; do
+      c="$(command -v "$nome" 2>/dev/null || true)"
+      if [ -n "$c" ]; then echo "$c|$(command -v freecad 2>/dev/null || command -v FreeCAD 2>/dev/null || true)"; fi
+    done
+  fi
+  return 0
+}
+
+achar_freecad() {
+  local linha cmd gui v
+  while IFS= read -r linha; do
+    [ -n "$linha" ] || continue
+    cmd="${linha%%|*}"; gui="${linha#*|}"
+    [ -x "$cmd" ] || continue
+    v="$(versao_de "$cmd")"
+    if versao_ok "$v"; then
+      FREECADCMD="$cmd"; FREECAD_GUI="$gui"; FREECAD_VERSAO="$v"
+      return 0
+    elif [ -n "$v" ]; then
+      info "ignorando FreeCAD $v em $cmd (precisa 1.0 ou mais novo)"
+    else
+      info "ignorando $cmd (não respondeu)"
+    fi
+  done < <(candidatos | awk '!visto[$0]++')
+  return 1
+}
+
+sha256_de() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+
+instalar_linux() {
+  local arq sha
+  case "$ARCH" in
+    x86_64|amd64) arq=x86_64; sha=$FC_SHA_x86_64 ;;
+    aarch64|arm64) arq=aarch64; sha=$FC_SHA_aarch64 ;;
+    *) erro "arquitetura $ARCH sem AppImage oficial do FreeCAD. Instale o FreeCAD 1.x pela distro e rode p3d setup de novo." ;;
+  esac
+  command -v curl >/dev/null 2>&1 || erro "preciso do curl para baixar o FreeCAD (ex.: sudo apt install curl)"
+  ldd --version >/dev/null 2>&1 || erro "o AppImage do FreeCAD precisa de glibc (Alpine e outras com musl não rodam)"
+
+  local destino="$DADOS/freecad-$FC_VERSAO"
+  local nome="FreeCAD_${FC_VERSAO}-Linux-${arq}-py311.AppImage"
+  local url="https://github.com/FreeCAD/FreeCAD/releases/download/$FC_VERSAO/$nome"
+  mkdir -p "$DADOS"
+
+  local livre_mb
+  livre_mb="$(df -Pk "$DADOS" | awk 'NR==2 {print int($4/1024)}')"
+  [ "${livre_mb:-0}" -ge $ESPACO_MB ] || erro "pouco espaço em $DADOS: ${livre_mb} MB livres, preciso de ~$ESPACO_MB MB"
+
+  # Trava contra dois setups ao mesmo tempo.
+  if ! mkdir "$DADOS/.trava" 2>/dev/null; then
+    erro "outro p3d setup está rodando (se não estiver, apague $DADOS/.trava)"
+  fi
+  trap 'rmdir "$DADOS/.trava" 2>/dev/null || true' EXIT
+
+  mkdir -p "$destino"
+  local parte="$destino/$nome.part"
+  info "baixando FreeCAD $FC_VERSAO para Linux $arq (~800 MB; retoma se cair)"
+  curl -fL -sS --retry 5 --retry-delay 3 -C - -o "$parte" "$url" \
+    || erro "download falhou. Rode p3d setup de novo para continuar de onde parou."
+  info "conferindo SHA256"
+  [ "$(sha256_de "$parte")" = "$sha" ] || { rm -f "$parte"; erro "SHA256 não confere: arquivo apagado, rode p3d setup de novo"; }
+  mv "$parte" "$destino/$nome"
+  chmod +x "$destino/$nome"
+
+  info "extraindo (sem sudo e sem FUSE)"
+  local tmp="$destino/.extraindo"
+  rm -rf "$tmp" "$destino/app"
+  mkdir -p "$tmp"
+  (cd "$tmp" && "$destino/$nome" --appimage-extract >/dev/null) || { rm -rf "$tmp"; erro "extração falhou (disco cheio ou pasta montada com noexec?)"; }
+  mv "$tmp/squashfs-root" "$destino/app"
+  rm -rf "${tmp:?}" "${destino:?}/$nome"
+  touch "$destino/.ok"
+}
+
+conferir_modulos() {
+  local saida
+  saida="$(cmd_gerar "$SKILL/lib/checar_instalacao.py" 2>&1 || true)"
+  printf '%s\n' "$saida" | grep -E '^(MODULOS_OK|AVISO)' >&2 || true
+  printf '%s\n' "$saida" | grep -q '^MODULOS_OK' || { printf '%s\n' "$saida" | tail -15 >&2; return 1; }
+}
+
+cmd_setup() {
+  ler_config
+  if ! achar_freecad; then
+    if [ "$SO" = Darwin ]; then
+      erro "FreeCAD 1.x não encontrado. Instale com 'brew install --cask freecad' ou pelo .dmg de https://www.freecad.org/downloads.php e rode p3d setup de novo."
+    fi
+    info "FreeCAD 1.x não encontrado; instalando o $FC_VERSAO"
+    instalar_linux
+    FREECADCMD=""; FREECAD_GUI=""
+    achar_freecad || erro "instalei, mas o freecadcmd não respondeu. Rode p3d diagnostico."
+  fi
+  gravar_config
+  info "FreeCAD $FREECAD_VERSAO em $FREECADCMD"
+  [ "$FREECAD_VERSAO" = "$FC_VERSAO" ] || info "aviso: testado com o $FC_VERSAO; esta é a $FREECAD_VERSAO"
+  conferir_modulos || erro "o FreeCAD respondeu, mas faltam módulos"
+  if [ "$SO" = Linux ] && [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+    info "sem tela (DISPLAY vazio): gerar e validar funcionam; abrir precisa de área de trabalho"
+  fi
+  echo "SETUP_OK FreeCAD $FREECAD_VERSAO"
+}
+
+exigir_setup() {
+  ler_config
+  [ -n "$FREECADCMD" ] || erro "FreeCAD ainda não configurado. Rode: p3d setup (no Linux baixa ~800 MB e ocupa ~3 GB)"
+  [ -x "$FREECADCMD" ] || erro "FreeCAD não está mais em $FREECADCMD. Rode: p3d setup"
+}
+
+cmd_diagnostico() {
+  ler_config
+  echo "p3d $VERSAO, testado com FreeCAD $FC_VERSAO"
+  echo "sistema: $SO $ARCH"
+  echo "skill:   $SKILL"
+  if [ -f "$CONF" ]; then echo "config:  $CONF"; else echo "config:  não existe (rode p3d setup)"; fi
+  echo "tela:    ${DISPLAY:-}${WAYLAND_DISPLAY:-}$([ "$SO" = Darwin ] && echo macOS || true)"
+  echo "FreeCAD encontrados:"
+  local l v
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    if [ -x "${l%%|*}" ]; then v="$(versao_de "${l%%|*}")"; else v=""; fi
+    echo "  ${l%%|*} -> ${v:-não roda}"
+  done < <(candidatos | awk '!visto[$0]++')
+  return 0
+}
+
+# Tira só o ruído conhecido do FreeCAD: barra de progresso "(N %)", "Recompute...",
+# banner e o aviso do driver 3Dconnexion. Sempre devolve 0.
+filtro() {
+  tr '\r' '\n' | sed -E -e 's/[[:space:]]*\([0-9]+ %\)//g' -e 's/[[:space:]]*Recompute\.+//g' \
+    | grep -vE '^[[:space:]]*$|^FreeCAD [0-9.]+, Libs: |^\(C\) [0-9]{4}-[0-9]{4} FreeCAD|^FreeCAD is free and open-source|3DconnexionNavlib' \
+    || true
+}
+
+cmd_gerar() {
+  [ $# -ge 1 ] || erro "uso: p3d gerar script.py [param=valor ...]"
+  exigir_setup
+  local script="$1"; shift
+  [ -f "$script" ] || erro "script não encontrado: $script"
+  script="$(cd "$(dirname "$script")" && pwd)/$(basename "$script")"
+  export FCAD_ARGC=$#
+  local i=0 a
+  for a in "$@"; do export "FCAD_ARG_$i=$a"; i=$((i + 1)); done
+  export FCAD_SCRIPT="$script" FCAD_LIB="$SKILL/lib" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+  local rc
+  set +e
+  LC_ALL=$LOCALE_UTF8 com_limite "${P3D_TIMEOUT:-1800}" "$FREECADCMD" "$SKILL/scripts/_fcad_runner.py" </dev/null 2>&1 | filtro
+  rc=${PIPESTATUS[0]}
+  set -e
+  [ "$rc" -eq 124 ] && echo "p3d: passou de ${P3D_TIMEOUT:-1800} s e foi interrompido (P3D_TIMEOUT aumenta)" >&2
+  return "$rc"
+}
+
+cmd_validar() {
+  [ $# -ge 1 ] && [ -f "$1" ] || erro "uso: p3d validar arquivo.FCStd [--exportar]"
+  local arq; arq="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+  shift
+  cmd_gerar "$SKILL/lib/validar.py" "$arq" "$@"
+}
+
+cmd_render() {
+  [ $# -ge 1 ] && [ -f "$1" ] || erro "uso: p3d render arquivo.stl [saida.png] [cor_hex] [iso|tras|topo]"
+  local stl out cor="${3:-E07A2F}" vista="${4:-iso}"
+  stl="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+  out="${2:-${stl%.*}.png}"
+  cor="${cor#\#}"
+  [[ "$cor" =~ ^[0-9A-Fa-f]{6}$ ]] || erro "cor inválida: $cor (use 6 dígitos hex, ex. E07A2F)"
+  case "$vista" in iso|tras|topo) ;; *) erro "vista inválida: $vista (iso, tras ou topo)" ;; esac
+  mkdir -p "$(dirname "$out")" || erro "não consegui criar a pasta de $out"
+  out="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
+  cmd_gerar "$SKILL/lib/render.py" "$stl" "$out" "$cor" "$vista"
+}
+
+cmd_abrir() {
+  [ $# -eq 1 ] && [ -f "$1" ] || erro "uso: p3d abrir arquivo.FCStd"
+  exigir_setup
+  local arq; arq="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+  if [ "$SO" = Darwin ] && [[ "$FREECAD_GUI" == *.app/Contents/MacOS/* ]]; then
+    # Pelo LaunchServices para virar app de verdade; -n porque com o FreeCAD já aberto
+    # os argumentos seriam ignorados.
+    open -n -a "${FREECAD_GUI%/Contents/MacOS/*}" --args "$arq" "$SKILL/lib/aparencia.py"
+    echo "ABERTO $arq"
+    info "se a janela não aparecer: o macOS está pedindo acesso à pasta (Ajustes > Privacidade e Segurança > Arquivos e Pastas)"
+    return 0
+  fi
+  if [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+    echo "SEM_TELA $arq"
+    info "sem área de trabalho nesta sessão; abra o arquivo pelo FreeCAD"
+    return 3
+  fi
+  [ -n "$FREECAD_GUI" ] && [ -x "$FREECAD_GUI" ] || erro "FreeCAD com janela não encontrado; rode p3d setup"
+  mkdir -p "$DADOS"
+  local log="$DADOS/abrir.log"
+  nohup "$FREECAD_GUI" "$arq" "$SKILL/lib/aparencia.py" >"$log" 2>&1 &
+  local pid=$! n=0
+  while [ $n -lt 15 ]; do
+    sleep 1; n=$((n + 1))
+    kill -0 "$pid" 2>/dev/null || { tail -20 "$log" >&2; erro "o FreeCAD fechou ao abrir; log em $log"; }
+  done
+  echo "ABERTO $arq (pid $pid)"
+}
+
+cmd_testar() {
+  exigir_setup
+  local falhou=0 saida t tmp
+  P3D_TMP="$(mktemp -d "${TMPDIR:-/tmp}/p3d-teste.XXXXXX")"
+  tmp="$P3D_TMP"
+  trap 'rm -rf "$P3D_TMP"' EXIT
+  for t in "$SKILL"/tests/test_*.py; do
+    saida="$(cmd_gerar "$t" 2>&1 || true)"
+    if printf '%s\n' "$saida" | grep -qx '0 falha(s)'; then echo "TESTE_OK $(basename "$t")"
+    else printf '%s\n' "$saida" | tail -20 >&2; echo "TESTE_FALHOU $(basename "$t")"; falhou=1; fi
+  done
+  cp -R "$SKILL/exemplos/regua-folgas" "$tmp/"
+  saida="$(cmd_gerar "$tmp/regua-folgas/peca.py" 2>&1 || true)"
+  if printf '%s\n' "$saida" | grep -qx 'VALIDACAO_OK'; then echo "TESTE_OK gerar exemplo"
+  else printf '%s\n' "$saida" | tail -20 >&2; echo "TESTE_FALHOU gerar exemplo"; falhou=1; fi
+  if [ $falhou -eq 0 ]; then
+    saida="$(cmd_validar "$tmp/regua-folgas/saida/regua-folgas.FCStd" --exportar 2>&1 || true)"
+    if printf '%s\n' "$saida" | grep -qx 'VALIDACAO_OK'; then echo "TESTE_OK validar"
+    else printf '%s\n' "$saida" | tail -20 >&2; echo "TESTE_FALHOU validar"; falhou=1; fi
+    saida="$(cmd_render "$tmp/regua-folgas/saida/regua-folgas.stl" 2>&1 || true)"
+    if printf '%s\n' "$saida" | grep -q '^PREVIEW_OK'; then echo "TESTE_OK render"
+    else printf '%s\n' "$saida" | tail -20 >&2; echo "TESTE_FALHOU render"; falhou=1; fi
+  fi
+  if [ $falhou -eq 0 ]; then echo "TODOS_OK"; else echo "HOUVE_FALHA"; return 1; fi
+}
+
+cmd_nova() {
+  [ $# -eq 2 ] || erro "uso: p3d nova <nome-em-kebab> <pasta-do-projeto>"
+  local nome="$1" base="$2"
+  [[ "$nome" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || erro "nome em kebab-case: letras minúsculas, números e hífen (ex.: suporte-celular)"
+  mkdir -p "$base"
+  base="$(cd "$base" && pwd)"
+  case "$base/" in "$SKILL"/*) erro "não crie peças dentro da pasta da skill; use a pasta do projeto" ;; esac
+  local dir="$base/$nome"
+  [ -e "$dir/peca.py" ] && erro "$dir/peca.py já existe"
+  mkdir -p "$dir"
+  sed "s/__NOME__/$nome/g" "$SKILL/exemplos/modelo-peca.py" > "$dir/peca.py"
+  echo "CRIADO $dir/peca.py"
+}
+
+ajuda() { sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+sub="${1:-}"
+[ $# -gt 0 ] && shift
+case "$sub" in
+  setup) cmd_setup ;;
+  diagnostico) cmd_diagnostico ;;
+  gerar) cmd_gerar "$@" ;;
+  validar) cmd_validar "$@" ;;
+  render) cmd_render "$@" ;;
+  abrir) cmd_abrir "$@" ;;
+  testar) cmd_testar ;;
+  nova) cmd_nova "$@" ;;
+  --version|-v|versao) echo "p3d $VERSAO (FreeCAD testado: $FC_VERSAO)" ;;
+  ""|-h|--help|ajuda|help) ajuda ;;
+  *) ajuda >&2; exit 2 ;;
+esac
