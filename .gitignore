@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+saida/
+*.FCBak
+*.FCStd1
+.DS_Store
