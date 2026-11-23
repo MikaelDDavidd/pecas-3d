@@ -133,19 +133,34 @@ def conferir(doc, pecas=None, mudancas=None, pasta_saida=None, nome=None, linear
     if pasta_saida:
         nome = nome or doc.Name
         if salvar:
+            # a malha usada fica no arquivo: o `p3d validar --exportar` reexporta igual
+            meta = dict(doc.Meta)
+            meta.update(p3d_stl_linear=str(linear), p3d_stl_angular=str(angular))
+            doc.Meta = meta
             av.salvar(doc, os.path.join(pasta_saida, f"{nome}.FCStd"))
-        out = av.exportar_pecas(pecas, pasta_saida, nome, linear=linear, angular=angular)
-        rel.item("STL fechado, sem non-manifold e sem auto-interseção", out["stl_check"]["ok"])
+        ok = exportar_stl(pecas, pasta_saida, nome, linear, angular)
+        rel.item("STL fechado, sem non-manifold e sem auto-interseção", ok)
         if stl_por_peca and len(pecas) > 1:
             for p in pecas:
-                o = av.exportar_pecas([p], pasta_saida, _kebab(p.Label), linear=linear, angular=angular)
-                rel.item(f"STL de {p.Label}", o["stl_check"]["ok"])
+                rel.item(f"STL de {p.Label}", exportar_stl([p], pasta_saida, _kebab(p.Label), linear, angular))
 
     if rel.falhas:
         print("VALIDACAO_FALHOU: " + "; ".join(rel.falhas))
         return False
     print("VALIDACAO_OK")
     return True
+
+
+def exportar_stl(pecas, pasta, nome, linear, angular):
+    """Exporta STEP e STL. Curva B-spline de texto gravado às vezes gera auto-interseção na
+    malha; nesse caso tenta de novo com malha mais fina antes de dar como falha."""
+    for tentativa in range(3):
+        out = av.exportar_pecas(pecas, pasta, nome, linear=linear, angular=angular)
+        if out["stl_check"]["ok"]:
+            return True
+        linear, angular = linear / 2, angular / 2
+        print(f"     malha com defeito; refazendo com desvio {linear:g} mm")
+    return False
 
 
 def _kebab(texto):

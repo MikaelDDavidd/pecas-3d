@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1 - 2026-11-23
+
+- `p3d validar --exportar` reexporta com a mesma malha usada na geração (fica gravada no .FCStd).
+- STL com defeito de malha (comum em texto gravado) é refeito com malha mais fina antes de dar falha.
+
 ## 0.1.0 - 2026-11-23
 
 Primeira versão.

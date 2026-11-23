@@ -1,6 +1,6 @@
 {
   "name": "pecas-3d",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Peças para impressão 3D modeladas por script no FreeCAD, com árvore editável, validação e STL pronto para fatiar.",
   "author": { "name": "Mikael David" },
   "homepage": "https://github.com/MikaelDDavidd/pecas-3d",
