@@ -1,0 +1,12 @@
+{
+  "name": "pecas-3d",
+  "owner": { "name": "Mikael David" },
+  "plugins": [
+    {
+      "name": "pecas-3d",
+      "source": "./",
+      "description": "Peças para impressão 3D modeladas por script no FreeCAD, com árvore editável, validação e STL pronto para fatiar.",
+      "version": "0.1.0"
+    }
+  ]
+}
