@@ -4,3 +4,12 @@ saida/
 *.FCBak
 *.FCStd1
 .DS_Store
+
+# arquivos de agente (ficam só na máquina)
+CLAUDE.md
+CLAUDE.local.md
+**/CLAUDE.md
+.claude/
+.mcp.json
+AGENTS.md
+GEMINI.md
