@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck skills/pecas-3d/scripts/p3d
+
+  testes:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pecas-3d
+          key: freecad-1.1.4-${{ runner.arch }}
+      - name: setup
+        run: bash skills/pecas-3d/scripts/p3d setup
+      - name: testar
+        run: bash skills/pecas-3d/scripts/p3d testar
+      - name: engrenagem
+        run: |
+          cp -R skills/pecas-3d/exemplos/engrenagem-registro "$RUNNER_TEMP/"
+          bash skills/pecas-3d/scripts/p3d gerar "$RUNNER_TEMP/engrenagem-registro/peca.py" | tee saida.txt
+          grep -qx VALIDACAO_OK saida.txt
